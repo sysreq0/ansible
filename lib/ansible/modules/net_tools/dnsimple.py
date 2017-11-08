@@ -79,6 +79,13 @@ options:
     required: false
     default: null
 
+  certificate:
+    description:
+      - Whether we should fetch the list of SSL certificates tied to a domain (if 'record' is omitted),
+        or the certificate and private key for a specific record.
+    required: false
+    default: null
+
   state:
     description:
       - whether the record should exist or not
@@ -158,6 +165,19 @@ EXAMPLES = '''
     value: example.com
     state: absent
   delegate_to: localhost
+
+# fetch all SSL certificates tied to my.com
+- dnsimple:
+    domain: my.com
+    certificate: yes
+  delegate_to: localhost
+
+# fetch the SSL certificate and private key for test.my.com
+- dnsimple:
+    domain: my.com
+    record: test
+    certificate: yes
+  delegate_to: localhost
 '''
 
 import os
@@ -185,6 +205,7 @@ def main():
             ttl=dict(required=False, default=3600, type='int'),
             value=dict(required=False),
             priority=dict(required=False, type='int'),
+            certificate=dict(required=False, type='bool'),
             state=dict(required=False, choices=['present', 'absent']),
             solo=dict(required=False, type='bool'),
         ),
@@ -206,6 +227,7 @@ def main():
     ttl               = module.params.get('ttl')
     value             = module.params.get('value')
     priority          = module.params.get('priority')
+    certificate       = module.params.get('certificate')
     state             = module.params.get('state')
     is_solo           = module.params.get('solo')
 
@@ -222,11 +244,19 @@ def main():
         # No domain, return a list
         if not domain:
             domains = client.domains()
-            module.exit_json(changed=False, result=[d['domain'] for d in domains])
+            module.exit_json(changed=False, result=[d for d in domains])
+
+        # Domain, and certificate is true
+        if domain and certificate and record is None:
+            module.exit_json(changed=False, result=client.certificates(str(domain)))
+
+        # Domain, certificate is true, and a record is present
+        if domain and certificate and record is not None:
+            module.exit_json(changed=False, result=client.certificate(str(domain), str(record)))
 
         # Domain & No record
         if domain and record is None and not record_ids:
-            domains = [d['domain'] for d in client.domains()]
+            domains = [d for d in client.domains()]
             if domain.isdigit():
                 dr = next((d for d in domains if d['id'] == int(domain)), None)
             else:
@@ -238,7 +268,7 @@ def main():
                     if module.check_mode:
                         module.exit_json(changed=True)
                     else:
-                        module.exit_json(changed=True, result=client.add_domain(domain)['domain'])
+                        module.exit_json(changed=True, result=client.add_domain(domain))
             elif state == 'absent':
                 if dr:
                     if not module.check_mode:
@@ -251,7 +281,7 @@ def main():
 
         # need the not none check since record could be an empty string
         if domain and record is not None:
-            records = [r['record'] for r in client.records(str(domain))]
+            records = [r for r in client.records(str(domain))]
 
             if not record_type:
                 module.fail_json(msg="Missing the record type")
@@ -259,13 +289,13 @@ def main():
             if not value:
                 module.fail_json(msg="Missing the record value")
 
-            rr = next((r for r in records if r['name'] == record and r['record_type'] == record_type and r['content'] == value), None)
+            rr = next((r for r in records if r['name'] == record and r['type'] == record_type and r['content'] == value), None)
 
             if state == 'present':
                 changed = False
                 if is_solo:
                     # delete any records that have the same name and record type
-                    same_type = [r['id'] for r in records if r['name'] == record and r['record_type'] == record_type]
+                    same_type = [r['id'] for r in records if r['name'] == record and r['type'] == record_type]
                     if rr:
                         same_type = [rid for rid in same_type if rid != rr['id']]
                     if same_type:
@@ -275,33 +305,33 @@ def main():
                         changed = True
                 if rr:
                     # check if we need to update
-                    if rr['ttl'] != ttl or rr['prio'] != priority:
+                    if rr['ttl'] != ttl or rr['priority'] != priority:
                         data = {}
                         if ttl:
-                            data['ttl']  = ttl
+                            data['ttl'] = ttl
                         if priority:
-                            data['prio'] = priority
+                            data['priority'] = priority
                         if module.check_mode:
                             module.exit_json(changed=True)
                         else:
-                            module.exit_json(changed=True, result=client.update_record(str(domain), str(rr['id']), data)['record'])
+                            module.exit_json(changed=True, result=client.update_record(str(domain), str(rr['id']), data))
                     else:
                         module.exit_json(changed=changed, result=rr)
                 else:
                     # create it
                     data = {
-                        'name':        record,
-                        'record_type': record_type,
-                        'content':     value,
+                        'name': record,
+                        'type': record_type,
+                        'content': value,
                     }
                     if ttl:
-                        data['ttl']  = ttl
+                        data['ttl'] = ttl
                     if priority:
-                        data['prio'] = priority
+                        data['priority'] = priority
                     if module.check_mode:
                         module.exit_json(changed=True)
                     else:
-                        module.exit_json(changed=True, result=client.add_record(str(domain), data)['record'])
+                        module.exit_json(changed=True, result=client.add_record(str(domain), data))
             elif state == 'absent':
                 if rr:
                     if not module.check_mode:
@@ -314,7 +344,7 @@ def main():
 
         # Make sure these record_ids either all exist or none
         if domain and record_ids:
-            current_records = [str(r['record']['id']) for r in client.records(str(domain))]
+            current_records = [str(r['id']) for r in client.records(str(domain))]
             wanted_records  = [str(r) for r in record_ids]
             if state == 'present':
                 difference = list(set(wanted_records) - set(current_records))
